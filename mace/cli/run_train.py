@@ -880,6 +880,15 @@ def run(args) -> None:
                 "Please install it to use XPU device."
             )
 
+    # Initialize unified CSV logger (TrumbleMOF-compatible format)
+    csv_logger = None
+    csv_log_base = getattr(args, "csv_log_dir", None) or (
+        os.path.join(args.log_dir, args.name) if args.log_dir else None
+    )
+    if csv_log_base and rank == 0:
+        from mace.tools.csv_logger import CSVLogger
+        csv_logger = CSVLogger(job_name="", base_dir=csv_log_base)
+
     tools.train(
         model=model,
         loss_fn=loss_fn,
@@ -906,6 +915,11 @@ def run(args) -> None:
         plotter=plotter,
         train_sampler=train_sampler,
         rank=rank,
+        csv_logger=csv_logger,
+        z_table=z_table,
+        max_steps=getattr(args, 'max_steps', 1_000_000),
+        eval_interval_steps=getattr(args, 'eval_interval_steps', 500),
+        csv_log_interval=getattr(args, 'csv_log_interval', 10),
     )
 
     logging.info("")

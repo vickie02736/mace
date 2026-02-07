@@ -38,6 +38,38 @@ from .utils import (
 )
 
 
+def _log_train_csv(csv_logger, metrics, step, rank_val, lr=0.0, epoch=0):
+    """Log training metrics to unified CSV format (TrumbleMOF-compatible)."""
+    csv_logger.log({
+        "train/loss": metrics.get("loss", 0.0),
+        "train/mae_energy": metrics.get("mae_energy_per_atom", 0.0),
+        "train/mae_forces": metrics.get("mae_forces_per_A", 0.0),
+        "train/lr": lr,
+        "train/epoch": epoch,
+    }, step=step)
+
+
+def _log_val_csv(csv_logger, eval_metrics, step, rank_val, epoch=0):
+    """Log validation + per-element metrics to unified CSV format (TrumbleMOF-compatible)."""
+    csv_logger.log({
+        "val/loss": eval_metrics.get("loss", 0.0),
+        "val/mae_energy": eval_metrics.get("mae_e_per_atom", 0.0),
+        "val/mae_forces": eval_metrics.get("mae_f", 0.0),
+        "val/rmse_energy": eval_metrics.get("rmse_e_per_atom", 0.0),
+        "val/rmse_forces": eval_metrics.get("rmse_f", 0.0),
+        "val/epoch": epoch,
+    }, step=step)
+    # Per-element metrics: {element}/log.csv with val_mae_energy, val_mae_forces
+    per_atom_type = eval_metrics.get("per_atom_type", {})
+    for symbol, m in per_atom_type.items():
+        csv_logger.log({
+            f"{symbol}/val_mae_energy": m.get("mae_energy_per_atom", 0.0),
+            f"{symbol}/val_mae_forces": m.get("mae_forces_per_A", 0.0),
+            f"{symbol}/train_mae_energy": 0.0,  # Only val per-element during validation
+            f"{symbol}/train_mae_forces": 0.0,
+        }, step=step)
+
+
 @dataclasses.dataclass
 class SWAContainer:
     model: AveragedModel
@@ -172,12 +204,18 @@ def train(
     distributed_model: Optional[DistributedDataParallel] = None,
     train_sampler: Optional[DistributedSampler] = None,
     rank: Optional[int] = 0,
+    csv_logger=None,
+    z_table=None,
+    max_steps: int = 1_000_000,
+    eval_interval_steps: int = 500,
+    csv_log_interval: int = 10,
 ):
     lowest_loss = np.inf
     valid_loss = np.inf
     patience_counter = 0
     swa_start = True
     keep_last = False
+    global_step = 0
     if log_wandb:
         import wandb
 
@@ -187,6 +225,10 @@ def train(
     logging.info("")
     logging.info("===========TRAINING===========")
     logging.info("Started training, reporting errors on validation set")
+    logging.info(
+        f"max_steps={max_steps}, eval_interval_steps={eval_interval_steps}, "
+        f"csv_log_interval={csv_log_interval}, patience={patience} evals"
+    )
     logging.info("Loss metrics on validation set")
     epoch = start_epoch
 
@@ -198,15 +240,20 @@ def train(
             data_loader=valid_loader,
             output_args=output_args,
             device=device,
+            z_table=z_table,
         )
         valid_err_log(
             valid_loss_head, eval_metrics, logger, log_errors, None, valid_loader_name
         )
+        # CSV logging for initial validation
+        if csv_logger is not None and rank == 0:
+            _log_val_csv(csv_logger, eval_metrics, step=0, rank_val=rank, epoch=0)
     valid_loss = valid_loss_head  # consider only the last head for the checkpoint
 
     # variable used for broadcast by rank == 0 if epoch loop is exited early, e.g. patience
     exit_now = torch.zeros(1, device=device) if distributed else None
-    while epoch < max_num_epochs:
+    stop_training = False
+    while epoch < max_num_epochs and not stop_training:
         # LR scheduler and SWA update
         if swa is None or epoch < swa.start:
             if epoch > start_epoch:
@@ -229,7 +276,12 @@ def train(
             train_sampler.set_epoch(epoch)
         if "ScheduleFree" in type(optimizer).__name__:
             optimizer.train()
-        train_one_epoch(
+        # Use mutable refs to communicate state changes from mid-epoch validation
+        _valid_loss_ref = [valid_loss]
+        _lowest_loss_ref = [lowest_loss]
+        _patience_counter_ref = [patience_counter]
+        _keep_last_ref = [keep_last]
+        global_step, stop_training = train_one_epoch(
             model=model,
             loss_fn=loss_fn,
             data_loader=train_loader,
@@ -243,12 +295,46 @@ def train(
             distributed=distributed,
             distributed_model=distributed_model,
             rank=rank,
+            csv_logger=csv_logger,
+            global_step=global_step,
+            max_steps=max_steps,
+            csv_log_interval=csv_log_interval,
+            eval_interval_steps=eval_interval_steps,
+            valid_loaders=valid_loaders,
+            loss_fn_eval=loss_fn,
+            output_args_eval=output_args,
+            log_errors=log_errors,
+            z_table=z_table,
+            log_wandb=log_wandb,
+            checkpoint_handler=checkpoint_handler,
+            lr_scheduler_obj=lr_scheduler,
+            save_all_checkpoints=save_all_checkpoints,
+            plotter=plotter,
+            lowest_loss=lowest_loss,
+            patience_counter=patience_counter,
+            patience=patience,
+            swa=swa,
+            keep_last=keep_last,
+            exit_now=exit_now,
+            valid_loss_ref=_valid_loss_ref,
+            lowest_loss_ref=_lowest_loss_ref,
+            patience_counter_ref=_patience_counter_ref,
+            keep_last_ref=_keep_last_ref,
         )
+        # Recover mutable state from refs
+        valid_loss = _valid_loss_ref[0]
+        lowest_loss = _lowest_loss_ref[0]
+        patience_counter = _patience_counter_ref[0]
+        keep_last = _keep_last_ref[0]
         if distributed:
             torch.distributed.barrier()
 
-        # Validate
-        if epoch % eval_interval == 0:
+        if stop_training:
+            break
+
+        # Legacy epoch-based validation fallback (for compatibility; step-based is primary)
+        # Only run if eval_interval > 0 and no step-based eval happened this epoch
+        if eval_interval > 0 and eval_interval_steps <= 0 and epoch % eval_interval == 0:
             model_to_evaluate = (
                 model if distributed_model is None else distributed_model
             )
@@ -266,6 +352,7 @@ def train(
                         data_loader=valid_loader,
                         output_args=output_args,
                         device=device,
+                        z_table=z_table,
                     )
                     if rank == 0:
                         valid_err_log(
@@ -276,6 +363,8 @@ def train(
                             epoch,
                             valid_loader_name,
                         )
+                        if csv_logger is not None:
+                            _log_val_csv(csv_logger, eval_metrics, step=global_step, rank_val=rank, epoch=epoch)
                         if log_wandb:
                             wandb_log_dict[valid_loader_name] = {
                                 "epoch": epoch,
@@ -285,56 +374,11 @@ def train(
                                 ],
                                 "valid_rmse_f": eval_metrics["rmse_f"],
                             }
-                if plotter and epoch % plotter.plot_frequency == 0:
-                    try:
-                        plotter.plot(epoch, model_to_evaluate, rank)
-                    except Exception as e:  # pylint: disable=broad-except
-                        logging.debug(f"Plotting failed: {e}")
                 valid_loss = (
-                    valid_loss_head  # consider only the last head for the checkpoint
+                    valid_loss_head
                 )
             if log_wandb:
                 wandb.log(wandb_log_dict)
-            if rank == 0:
-                if valid_loss >= lowest_loss:
-                    patience_counter += 1
-                    if patience_counter >= patience:
-                        if swa is not None and epoch < swa.start:
-                            logging.info(
-                                f"Stopping optimization after {patience_counter} epochs without improvement and starting Stage Two"
-                            )
-                            epoch = swa.start
-                        else:
-                            logging.info(
-                                f"Stopping optimization after {patience_counter} epochs without improvement"
-                            )
-                            if exit_now is not None:
-                                exit_now.fill_(1)
-                    if save_all_checkpoints:
-                        param_context = (
-                            ema.average_parameters()
-                            if ema is not None
-                            else nullcontext()
-                        )
-                        with param_context:
-                            checkpoint_handler.save(
-                                state=CheckpointState(model, optimizer, lr_scheduler),
-                                epochs=epoch,
-                                keep_last=True,
-                            )
-                else:
-                    lowest_loss = valid_loss
-                    patience_counter = 0
-                    param_context = (
-                        ema.average_parameters() if ema is not None else nullcontext()
-                    )
-                    with param_context:
-                        checkpoint_handler.save(
-                            state=CheckpointState(model, optimizer, lr_scheduler),
-                            epochs=epoch,
-                            keep_last=keep_last,
-                        )
-                        keep_last = False or save_all_checkpoints
         if distributed:
             torch.distributed.barrier()
         if exit_now is not None:
@@ -361,8 +405,138 @@ def train_one_epoch(
     distributed: bool,
     distributed_model: Optional[DistributedDataParallel] = None,
     rank: Optional[int] = 0,
-) -> None:
+    csv_logger=None,
+    global_step: int = 0,
+    max_steps: int = 1_000_000,
+    csv_log_interval: int = 10,
+    eval_interval_steps: int = 500,
+    valid_loaders: Optional[Dict[str, DataLoader]] = None,
+    loss_fn_eval=None,
+    output_args_eval=None,
+    log_errors: str = "PerAtomRMSE",
+    z_table=None,
+    log_wandb: bool = False,
+    checkpoint_handler: Optional[CheckpointHandler] = None,
+    lr_scheduler_obj=None,
+    save_all_checkpoints: bool = False,
+    plotter=None,
+    lowest_loss: float = np.inf,
+    patience_counter: int = 0,
+    patience: int = 2048,
+    swa=None,
+    keep_last: bool = False,
+    exit_now=None,
+    valid_loss_ref: Optional[List[float]] = None,
+    lowest_loss_ref: Optional[List[float]] = None,
+    patience_counter_ref: Optional[List[int]] = None,
+    keep_last_ref: Optional[List[bool]] = None,
+) -> Tuple[int, bool]:
+    """Train for one epoch. Returns (global_step, stop_training)."""
     model_to_train = model if distributed_model is None else distributed_model
+    stop_training = False
+
+    # Use mutable refs if provided, else create local ones
+    if valid_loss_ref is None:
+        valid_loss_ref = [np.inf]
+    if lowest_loss_ref is None:
+        lowest_loss_ref = [lowest_loss]
+    if patience_counter_ref is None:
+        patience_counter_ref = [patience_counter]
+    if keep_last_ref is None:
+        keep_last_ref = [keep_last]
+
+    def _run_mid_epoch_validation():
+        """Run validation, checkpoint, and patience logic mid-epoch."""
+        nonlocal stop_training
+        if valid_loaders is None:
+            return
+        model_to_evaluate = model if distributed_model is None else distributed_model
+        param_context = (
+            ema.average_parameters() if ema is not None else nullcontext()
+        )
+        if "ScheduleFree" in type(optimizer).__name__:
+            optimizer.eval()
+        with param_context:
+            wandb_log_dict = {}
+            for vl_name, vl in valid_loaders.items():
+                valid_loss_head, eval_metrics = evaluate(
+                    model=model_to_evaluate,
+                    loss_fn=loss_fn_eval if loss_fn_eval is not None else loss_fn,
+                    data_loader=vl,
+                    output_args=output_args_eval if output_args_eval is not None else output_args,
+                    device=device,
+                    z_table=z_table,
+                )
+                if rank == 0:
+                    valid_err_log(
+                        valid_loss_head,
+                        eval_metrics,
+                        logger,
+                        log_errors,
+                        epoch,
+                        vl_name,
+                    )
+                    if csv_logger is not None:
+                        _log_val_csv(csv_logger, eval_metrics, step=global_step, rank_val=rank, epoch=epoch)
+                    if log_wandb:
+                        import wandb
+                        wandb_log_dict[vl_name] = {
+                            "epoch": epoch,
+                            "global_step": global_step,
+                            "valid_loss": valid_loss_head,
+                            "valid_rmse_e_per_atom": eval_metrics["rmse_e_per_atom"],
+                            "valid_rmse_f": eval_metrics["rmse_f"],
+                        }
+            if plotter and hasattr(plotter, 'plot_frequency') and global_step % (plotter.plot_frequency * eval_interval_steps) == 0:
+                try:
+                    plotter.plot(epoch, model_to_evaluate, rank)
+                except Exception as e:
+                    logging.debug(f"Plotting failed: {e}")
+            valid_loss_ref[0] = valid_loss_head
+        if log_wandb:
+            import wandb
+            wandb.log(wandb_log_dict)
+        if rank == 0:
+            if valid_loss_ref[0] >= lowest_loss_ref[0]:
+                patience_counter_ref[0] += 1
+                if patience_counter_ref[0] >= patience:
+                    if swa is not None and epoch < swa.start:
+                        logging.info(
+                            f"Stopping optimization after {patience_counter_ref[0]} evals without improvement and starting Stage Two"
+                        )
+                    else:
+                        logging.info(
+                            f"Stopping optimization after {patience_counter_ref[0]} evals without improvement (global_step={global_step})"
+                        )
+                        stop_training = True
+                        if exit_now is not None:
+                            exit_now.fill_(1)
+                if save_all_checkpoints and checkpoint_handler is not None:
+                    param_ctx = (
+                        ema.average_parameters() if ema is not None else nullcontext()
+                    )
+                    with param_ctx:
+                        checkpoint_handler.save(
+                            state=CheckpointState(model, optimizer, lr_scheduler_obj),
+                            epochs=epoch,
+                            keep_last=True,
+                        )
+            else:
+                lowest_loss_ref[0] = valid_loss_ref[0]
+                patience_counter_ref[0] = 0
+                if checkpoint_handler is not None:
+                    param_ctx = (
+                        ema.average_parameters() if ema is not None else nullcontext()
+                    )
+                    with param_ctx:
+                        checkpoint_handler.save(
+                            state=CheckpointState(model, optimizer, lr_scheduler_obj),
+                            epochs=epoch,
+                            keep_last=keep_last_ref[0],
+                        )
+                        keep_last_ref[0] = False or save_all_checkpoints
+        if "ScheduleFree" in type(optimizer).__name__:
+            optimizer.train()
 
     if isinstance(optimizer, LBFGS):
         _, opt_metrics = take_step_lbfgs(
@@ -381,6 +555,14 @@ def train_one_epoch(
         opt_metrics["epoch"] = epoch
         if rank == 0:
             logger.log(opt_metrics)
+            if csv_logger is not None and global_step % csv_log_interval == 0:
+                _log_train_csv(csv_logger, opt_metrics, step=global_step, rank_val=rank,
+                               lr=optimizer.param_groups[0]["lr"], epoch=epoch)
+        global_step += 1
+        if global_step >= max_steps:
+            stop_training = True
+        elif eval_interval_steps > 0 and global_step % eval_interval_steps == 0:
+            _run_mid_epoch_validation()
     else:
         for batch in data_loader:
             _, opt_metrics = take_step(
@@ -397,6 +579,19 @@ def train_one_epoch(
             opt_metrics["epoch"] = epoch
             if rank == 0:
                 logger.log(opt_metrics)
+                if csv_logger is not None and global_step % csv_log_interval == 0:
+                    _log_train_csv(csv_logger, opt_metrics, step=global_step, rank_val=rank,
+                                   lr=optimizer.param_groups[0]["lr"], epoch=epoch)
+            global_step += 1
+            if global_step >= max_steps:
+                stop_training = True
+                break
+            if eval_interval_steps > 0 and global_step % eval_interval_steps == 0:
+                _run_mid_epoch_validation()
+                if stop_training:
+                    break
+
+    return global_step, stop_training
 
 
 def take_step(
@@ -412,6 +607,7 @@ def take_step(
     start_time = time.time()
     batch = batch.to(device)
     batch_dict = batch.to_dict()
+    step_output = {}
 
     def closure():
         optimizer.zero_grad(set_to_none=True)
@@ -422,6 +618,7 @@ def take_step(
             compute_virials=output_args["virials"],
             compute_stress=output_args["stress"],
         )
+        step_output["model_output"] = output
         loss = loss_fn(pred=output, ref=batch)
         loss.backward()
         if max_grad_norm is not None:
@@ -439,6 +636,23 @@ def take_step(
         "loss": to_numpy(loss),
         "time": time.time() - start_time,
     }
+
+    # Compute additional training metrics for CSV logging
+    output = step_output.get("model_output", {})
+    with torch.no_grad():
+        if output.get("energy") is not None and batch.energy is not None:
+            num_atoms = batch.ptr[1:] - batch.ptr[:-1]
+            delta_e = batch.energy - output["energy"]
+            delta_e_per_atom = delta_e / num_atoms.float()
+            loss_dict["loss_energy_mse"] = float(to_numpy(torch.mean(delta_e_per_atom ** 2)))
+            loss_dict["mae_total_energy"] = float(to_numpy(torch.mean(torch.abs(delta_e))))
+            loss_dict["mae_energy_per_atom"] = float(to_numpy(torch.mean(torch.abs(delta_e_per_atom))))
+            loss_dict["rmse_energy_per_atom"] = float(to_numpy(torch.sqrt(torch.mean(delta_e_per_atom ** 2))))
+        if output.get("forces") is not None and batch.forces is not None:
+            delta_f = batch.forces - output["forces"]
+            loss_dict["loss_forces_mse"] = float(to_numpy(torch.mean(delta_f ** 2)))
+            loss_dict["mae_forces_per_A"] = float(to_numpy(torch.mean(torch.abs(delta_f))))
+            loss_dict["rmse_forces_per_A"] = float(to_numpy(torch.sqrt(torch.mean(delta_f ** 2))))
 
     return loss, loss_dict
 
@@ -559,10 +773,11 @@ def evaluate(
     data_loader: DataLoader,
     output_args: Dict[str, bool],
     device: torch.device,
+    z_table=None,
 ) -> Tuple[float, Dict[str, Any]]:
 
 
-    metrics = MACELoss(loss_fn=loss_fn).to(device)
+    metrics = MACELoss(loss_fn=loss_fn, z_table=z_table).to(device)
 
     start_time = time.time()
 
@@ -586,9 +801,10 @@ def evaluate(
 
 
 class MACELoss(Metric):
-    def __init__(self, loss_fn: torch.nn.Module):
+    def __init__(self, loss_fn: torch.nn.Module, z_table=None):
         super().__init__()
         self.loss_fn = loss_fn
+        self.z_table = z_table  # AtomicNumberTable for per-element metrics
         self.add_state("total_loss", default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("num_data", default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("E_computed", default=torch.tensor(0.0), dist_reduce_fx="sum")
@@ -597,6 +813,10 @@ class MACELoss(Metric):
         self.add_state("Fs_computed", default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("fs", default=[], dist_reduce_fx="cat")
         self.add_state("delta_fs", default=[], dist_reduce_fx="cat")
+        # Per-element tracking
+        self.add_state("atom_types", default=[], dist_reduce_fx="cat")
+        self.add_state("per_atom_delta_fs", default=[], dist_reduce_fx="cat")
+        self.add_state("per_atom_e_errors", default=[], dist_reduce_fx="cat")
         self.add_state(
             "stress_computed", default=torch.tensor(0.0), dist_reduce_fx="sum"
         )
@@ -625,12 +845,19 @@ class MACELoss(Metric):
 
         if output.get("energy") is not None and batch.energy is not None:
             self.delta_es.append(batch.energy - output["energy"])
+            num_atoms_per_graph = batch.ptr[1:] - batch.ptr[:-1]
             self.delta_es_per_atom.append(
-                (batch.energy - output["energy"]) / (batch.ptr[1:] - batch.ptr[:-1])
+                (batch.energy - output["energy"]) / num_atoms_per_graph
             )
             self.E_computed += filter_nonzero_weight(
                 batch, self.delta_es, batch.weight, batch.energy_weight
             )
+            # Per-element energy error: broadcast per-atom energy error to each atom
+            if self.z_table is not None:
+                e_err_per_atom = (batch.energy - output["energy"]) / num_atoms_per_graph
+                # Expand to per-atom: each atom gets its structure's per-atom energy error
+                atom_e_err = e_err_per_atom.repeat_interleave(num_atoms_per_graph)
+                self.per_atom_e_errors.append(atom_e_err)
         if output.get("forces") is not None and batch.forces is not None:
             self.fs.append(batch.forces)
             self.delta_fs.append(batch.forces - output["forces"])
@@ -641,6 +868,13 @@ class MACELoss(Metric):
                 batch.forces_weight,
                 spread_atoms=True,
             )
+            # Per-element force tracking
+            if self.z_table is not None:
+                self.per_atom_delta_fs.append(batch.forces - output["forces"])
+        # Track atom types for per-element metrics
+        if self.z_table is not None and hasattr(batch, "node_attrs"):
+            type_indices = torch.argmax(batch.node_attrs, dim=1)
+            self.atom_types.append(type_indices)
         if output.get("stress") is not None and batch.stress is not None:
             self.delta_stress.append(batch.stress - output["stress"])
             self.stress_computed += filter_nonzero_weight(
@@ -763,5 +997,35 @@ class MACELoss(Metric):
                 delta_polarizability_per_atom
             )
             aux["q95_polarizability"] = compute_q95(delta_polarizability)
+
+        # Per-element metrics
+        if self.z_table is not None and self.atom_types:
+            from ase.data import chemical_symbols
+            atom_types_cat = self.convert(self.atom_types).astype(int)
+            per_atom_type = {}
+            
+            has_forces = bool(self.per_atom_delta_fs)
+            has_energy = bool(self.per_atom_e_errors)
+            
+            if has_forces:
+                delta_fs_cat = self.convert(self.per_atom_delta_fs)  # (N_total, 3)
+            if has_energy:
+                e_errors_cat = self.convert(self.per_atom_e_errors)  # (N_total,)
+            
+            for type_idx in np.unique(atom_types_cat):
+                z_val = self.z_table.index_to_z(int(type_idx))
+                symbol = chemical_symbols[z_val]
+                mask = atom_types_cat == type_idx
+                elem_metrics = {}
+                if has_energy:
+                    elem_e_err = e_errors_cat[mask]
+                    elem_metrics["mae_energy_per_atom"] = float(np.mean(np.abs(elem_e_err)))
+                    elem_metrics["rmse_energy_per_atom"] = float(np.sqrt(np.mean(elem_e_err ** 2)))
+                if has_forces:
+                    elem_f_err = delta_fs_cat[mask]  # (n_elem, 3)
+                    elem_metrics["mae_forces_per_A"] = float(np.mean(np.abs(elem_f_err)))
+                    elem_metrics["rmse_forces_per_A"] = float(np.sqrt(np.mean(elem_f_err ** 2)))
+                per_atom_type[symbol] = elem_metrics
+            aux["per_atom_type"] = per_atom_type
 
         return aux["loss"], aux

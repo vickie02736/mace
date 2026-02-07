@@ -42,7 +42,10 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=".",
     )
     parser.add_argument(
-        "--log_dir", help="directory for log files", type=str, default=None
+        "--log_dir",
+        help="directory for log files and unified CSV logs",
+        type=str,
+        default="/media/damoxing/che-liu-fileset/kwz/kwz-data/log/MACE",
     )
     parser.add_argument(
         "--model_dir", help="directory for final model", type=str, default=None
@@ -55,6 +58,12 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--results_dir", help="directory for results", type=str, default=None
+    )
+    parser.add_argument(
+        "--csv_log_dir",
+        help="directory for unified CSV log output (defaults to log_dir/model_name when unset)",
+        type=str,
+        default=None,
     )
     parser.add_argument(
         "--downloads_dir", help="directory for downloads", type=str, default=None
@@ -871,9 +880,9 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--patience",
-        help="Maximum number of consecutive epochs of increasing loss",
+        help="Maximum number of consecutive validation checks without improvement before early stopping",
         type=int,
-        default=2048,
+        default=20,
     )
     parser.add_argument(
         "--foundation_model",
@@ -894,7 +903,25 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=True,
     )
     parser.add_argument(
-        "--eval_interval", help="evaluate model every <n> epochs", type=int, default=1
+        "--eval_interval", help="evaluate model every <n> epochs (legacy, use --eval_interval_steps instead)", type=int, default=1
+    )
+    parser.add_argument(
+        "--max_steps",
+        help="Maximum number of training steps (global_step). Training stops when reached.",
+        type=int,
+        default=1_000_000,
+    )
+    parser.add_argument(
+        "--eval_interval_steps",
+        help="Run validation every <n> global steps (0 to disable step-based eval and use epoch-based)",
+        type=int,
+        default=500,
+    )
+    parser.add_argument(
+        "--csv_log_interval",
+        help="Log training metrics to CSV every <n> global steps",
+        type=int,
+        default=10,
     )
     parser.add_argument(
         "--keep_checkpoints",
