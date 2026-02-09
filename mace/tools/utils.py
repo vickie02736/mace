@@ -75,20 +75,12 @@ def setup_logger(
     if directory is not None and tag is not None:
         os.makedirs(name=directory, exist_ok=True)
 
-        # Create file handler for non-debug logs
-        main_log_path = os.path.join(directory, f"{tag}.log")
-        fh_main = logging.FileHandler(main_log_path)
-        fh_main.setLevel(level)
-        fh_main.setFormatter(formatter)
-        logger.addHandler(fh_main)
-
-        # Create file handler for debug logs
-        debug_log_path = os.path.join(directory, f"{tag}_debug.log")
-        fh_debug = logging.FileHandler(debug_log_path)
-        fh_debug.setLevel(logging.DEBUG)
-        fh_debug.setFormatter(formatter)
-        fh_debug.addFilter(lambda record: record.levelno >= logging.DEBUG)
-        logger.addHandler(fh_debug)
+        # Single log file with all levels (DEBUG included)
+        log_path = os.path.join(directory, f"{tag}.log")
+        fh = logging.FileHandler(log_path)
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
 
 
 class AtomicNumberTable:

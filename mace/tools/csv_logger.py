@@ -78,7 +78,7 @@ class CSVLogger:
         file_path = os.path.join(dir_path, "log.csv")
         
         # Add step and timestamp
-        row = {"step": step, "timestamp": time.time(), **metrics}
+        row = {"global_step": step, "timestamp": time.time(), **metrics}
         
         if category not in self.writers:
             os.makedirs(dir_path, exist_ok=True)
@@ -115,7 +115,7 @@ class CSVLogger:
             current_keys = list(row.keys())
             
             # Merge existing fieldnames with current keys
-            fieldnames = existing_fieldnames if existing_fieldnames else ["step", "timestamp"]
+            fieldnames = existing_fieldnames if existing_fieldnames else ["global_step", "timestamp"]
             for k in current_keys:
                 if k not in fieldnames:
                     fieldnames.append(k)

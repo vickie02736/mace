@@ -24,12 +24,13 @@ done
 # Activate environment
 source /media/damoxing/che-liu-fileset/conda/etc/profile.d/conda.sh
 conda activate /media/damoxing/che-liu-fileset/kwz/kwz-data/envs/mace_env
+export PYTHONPATH="/media/damoxing/che-liu-fileset/kwz/mace:${PYTHONPATH:-}"
 
 WORK_DIR=$(mktemp -d)
 mkdir -p "$CSV_LOG_DIR"
 
 # MACE zero-shot evaluation: load model, run 0 epochs (initial validation pass only)
-PYTHONUNBUFFERED=1 mace_run_train \
+PYTHONUNBUFFERED=1 python -m mace.cli.run_train \
     --name="test_eval" \
     --foundation_model="$CKPT" \
     --train_file="$TEST_FILE" \

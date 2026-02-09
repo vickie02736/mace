@@ -34,6 +34,7 @@ done
 # Activate environment
 source /media/damoxing/che-liu-fileset/conda/etc/profile.d/conda.sh
 conda activate /media/damoxing/che-liu-fileset/kwz/kwz-data/envs/mace_env
+export PYTHONPATH="/media/damoxing/che-liu-fileset/kwz/mace:${PYTHONPATH:-}"
 
 mkdir -p "$WORK_DIR" "$CSV_LOG_DIR"
 
@@ -52,7 +53,7 @@ MAX_STEPS=$(python3 -c "import math; print(math.ceil(${NFRAMES} / ${BATCH_SIZE})
 echo "Finetune: nframes=${NFRAMES}, batch_size=${BATCH_SIZE}, max_steps=${MAX_STEPS}"
 
 # Step 3: Finetune (1 epoch)
-PYTHONUNBUFFERED=1 mace_run_train \
+PYTHONUNBUFFERED=1 python -m mace.cli.run_train \
     --name="ft_${NFRAMES}f" \
     --foundation_model="$CKPT" \
     --train_file="$FT_TRAIN_FILE" \

@@ -38,35 +38,50 @@ from .utils import (
 )
 
 
-def _log_train_csv(csv_logger, metrics, step, rank_val, lr=0.0, epoch=0):
-    """Log training metrics to unified CSV format (TrumbleMOF-compatible)."""
+def _log_train_csv(csv_logger, metrics, step, rank_val, lr=0.0, epoch=0,
+                    w_energy=None, training_phase=0):
+    """Log training metrics to unified CSV format (Allegro-compatible column names)."""
     csv_logger.log({
-        "train/loss": metrics.get("loss", 0.0),
-        "train/mae_energy": metrics.get("mae_energy_per_atom", 0.0),
-        "train/mae_forces": metrics.get("mae_forces_per_A", 0.0),
+        "train/loss_total": metrics.get("loss", 0.0),
+        "train/loss_energy_mse": metrics.get("loss_energy_mse", ""),
+        "train/loss_forces_mse": metrics.get("loss_forces_mse", ""),
+        "train/mae_total_energy": metrics.get("mae_total_energy", ""),
+        "train/mae_energy_per_atom": metrics.get("mae_energy_per_atom", ""),
+        "train/mae_forces_per_A": metrics.get("mae_forces_per_A", ""),
+        "train/rmse_energy_per_atom": metrics.get("rmse_energy_per_atom", ""),
+        "train/rmse_forces_per_A": metrics.get("rmse_forces_per_A", ""),
         "train/lr": lr,
+        "train/w_energy": w_energy if w_energy is not None else "",
+        "train/training_phase": training_phase,
+        "train/rank": rank_val,
         "train/epoch": epoch,
     }, step=step)
 
 
 def _log_val_csv(csv_logger, eval_metrics, step, rank_val, epoch=0):
-    """Log validation + per-element metrics to unified CSV format (TrumbleMOF-compatible)."""
+    """Log validation + per-element metrics to unified CSV format (Allegro-compatible column names)."""
     csv_logger.log({
-        "val/loss": eval_metrics.get("loss", 0.0),
-        "val/mae_energy": eval_metrics.get("mae_e_per_atom", 0.0),
-        "val/mae_forces": eval_metrics.get("mae_f", 0.0),
-        "val/rmse_energy": eval_metrics.get("rmse_e_per_atom", 0.0),
-        "val/rmse_forces": eval_metrics.get("rmse_f", 0.0),
+        "val/loss_total": eval_metrics.get("loss", 0.0),
+        "val/mae_energy_per_atom": eval_metrics.get("mae_e_per_atom", 0.0),
+        "val/mae_forces_per_A": eval_metrics.get("mae_f", 0.0),
+        "val/mae_total_energy": eval_metrics.get("mae_e", ""),
+        "val/rmse_energy_per_atom": eval_metrics.get("rmse_e_per_atom", 0.0),
+        "val/rmse_forces_per_A": eval_metrics.get("rmse_f", 0.0),
+        "val/rank": rank_val,
         "val/epoch": epoch,
     }, step=step)
-    # Per-element metrics: {element}/log.csv with val_mae_energy, val_mae_forces
+    # Per-element metrics: {element}/log.csv (Allegro-compatible column names)
     per_atom_type = eval_metrics.get("per_atom_type", {})
     for symbol, m in per_atom_type.items():
         csv_logger.log({
-            f"{symbol}/val_mae_energy": m.get("mae_energy_per_atom", 0.0),
-            f"{symbol}/val_mae_forces": m.get("mae_forces_per_A", 0.0),
-            f"{symbol}/train_mae_energy": 0.0,  # Only val per-element during validation
-            f"{symbol}/train_mae_forces": 0.0,
+            f"{symbol}/val_mae_energy_per_atom": m.get("mae_energy_per_atom", 0.0),
+            f"{symbol}/val_mae_forces_per_A": m.get("mae_forces_per_A", 0.0),
+            f"{symbol}/val_rmse_energy_per_atom": m.get("rmse_energy_per_atom", ""),
+            f"{symbol}/val_rmse_forces_per_A": m.get("rmse_forces_per_A", ""),
+            f"{symbol}/train_mae_energy_per_atom": 0.0,  # Only val per-element during validation
+            f"{symbol}/train_mae_forces_per_A": 0.0,
+            f"{symbol}/train_rmse_energy_per_atom": 0.0,
+            f"{symbol}/train_rmse_forces_per_A": 0.0,
         }, step=step)
 
 
@@ -538,6 +553,8 @@ def train_one_epoch(
         if "ScheduleFree" in type(optimizer).__name__:
             optimizer.train()
 
+    _training_phase = 1 if (swa is not None and epoch >= swa.start) else 0
+
     if isinstance(optimizer, LBFGS):
         _, opt_metrics = take_step_lbfgs(
             model=model_to_train,
@@ -557,7 +574,8 @@ def train_one_epoch(
             logger.log(opt_metrics)
             if csv_logger is not None and global_step % csv_log_interval == 0:
                 _log_train_csv(csv_logger, opt_metrics, step=global_step, rank_val=rank,
-                               lr=optimizer.param_groups[0]["lr"], epoch=epoch)
+                               lr=optimizer.param_groups[0]["lr"], epoch=epoch,
+                               training_phase=_training_phase)
         global_step += 1
         if global_step >= max_steps:
             stop_training = True
@@ -581,7 +599,8 @@ def train_one_epoch(
                 logger.log(opt_metrics)
                 if csv_logger is not None and global_step % csv_log_interval == 0:
                     _log_train_csv(csv_logger, opt_metrics, step=global_step, rank_val=rank,
-                                   lr=optimizer.param_groups[0]["lr"], epoch=epoch)
+                                   lr=optimizer.param_groups[0]["lr"], epoch=epoch,
+                                   training_phase=_training_phase)
             global_step += 1
             if global_step >= max_steps:
                 stop_training = True
@@ -999,13 +1018,13 @@ class MACELoss(Metric):
             aux["q95_polarizability"] = compute_q95(delta_polarizability)
 
         # Per-element metrics
-        if self.z_table is not None and self.atom_types:
+        if self.z_table is not None and len(self.atom_types) > 0:
             from ase.data import chemical_symbols
             atom_types_cat = self.convert(self.atom_types).astype(int)
             per_atom_type = {}
             
-            has_forces = bool(self.per_atom_delta_fs)
-            has_energy = bool(self.per_atom_e_errors)
+            has_forces = len(self.per_atom_delta_fs) > 0
+            has_energy = len(self.per_atom_e_errors) > 0
             
             if has_forces:
                 delta_fs_cat = self.convert(self.per_atom_delta_fs)  # (N_total, 3)

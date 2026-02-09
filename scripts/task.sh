@@ -2,18 +2,9 @@
 # MACE training tasks for CALF20_CO2 dataset.
 # Task 1: Train each of 7 xyz files independently (90/10 train/val split).
 # Task 2: Mixed 0ads+16ads training, then zero-shot/few-shot finetune on remaining test files.
-# Usage: ./task.sh [--background] [--task1] [--task2] [--task2-base] [--task2-finetune]
+# Usage: ./task.sh [--ddp] [--task1] [--task2] [--task2-base] [--task2-finetune]
 #   Default (no flag): run both task1 and task2 sequentially.
-
-SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-if [[ "$1" != "--background" ]]; then
-    echo "Starting task.sh in background..."
-    nohup bash "$SELF" --background "${@}" > /dev/null 2>&1 &
-    PID=$!
-    echo "Background process started with PID: $PID"
-    exit 0
-fi
-shift  # remove --background
+#   --ddp: enable multi-GPU training via torchrun (auto-detects GPU count)
 
 set -e
 
@@ -22,6 +13,7 @@ set -e
 # ============================================================
 source /media/damoxing/che-liu-fileset/conda/etc/profile.d/conda.sh
 conda activate /media/damoxing/che-liu-fileset/kwz/kwz-data/envs/mace_env
+export PYTHONPATH="/media/damoxing/che-liu-fileset/kwz/mace:${PYTHONPATH:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="/media/damoxing/che-liu-fileset/kwz/kwz-data/data/CALF20_CO2"
@@ -61,12 +53,14 @@ COMMON_ARGS=(
 # ============================================================
 # Parse which tasks to run
 # ============================================================
+USE_DDP=false
 RUN_TASK1=false
 RUN_TASK2_BASE=false
 RUN_TASK2_FT=false
 
 for arg in "$@"; do
     case "$arg" in
+        --ddp)          USE_DDP=true ;;
         --task1)        RUN_TASK1=true ;;
         --task2)        RUN_TASK2_BASE=true; RUN_TASK2_FT=true ;;
         --task2-base)   RUN_TASK2_BASE=true ;;
@@ -79,6 +73,20 @@ if ! $RUN_TASK1 && ! $RUN_TASK2_BASE && ! $RUN_TASK2_FT; then
     RUN_TASK1=true
     RUN_TASK2_BASE=true
     RUN_TASK2_FT=true
+fi
+
+# DDP setup: auto-detect GPUs; use torchrun when >1 GPU available
+NGPUS="${NGPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}"
+NGPUS="${NGPUS:-1}"
+
+if [ "$NGPUS" -gt 1 ] || $USE_DDP; then
+    DDP_LAUNCHER=("torchrun" "--nproc_per_node=$NGPUS")
+    DDP_ARGS=(--distributed --launcher=torchrun)
+    echo "DDP auto-enabled with $NGPUS GPU(s)" | tee -a "$LOG_FILE"
+else
+    DDP_LAUNCHER=("python")
+    DDP_ARGS=()
+    echo "Single-GPU mode" | tee -a "$LOG_FILE"
 fi
 
 # ============================================================
@@ -102,13 +110,12 @@ if $RUN_TASK1; then
 
         work_dir="${RUNS_DIR}/task1/${base}"
         csv_log_dir="${LOG_DIR}/task1/${base}"
-        task_log="${LOG_DIR}/task1/${base}.log"
         mkdir -p "$work_dir" "$csv_log_dir"
 
         echo "  Task1: $base started at $(date)" | tee -a "$LOG_FILE"
         echo "  work_dir=$work_dir, csv_log=$csv_log_dir" >> "$LOG_FILE"
 
-        PYTHONUNBUFFERED=1 mace_run_train \
+        PYTHONUNBUFFERED=1 "${DDP_LAUNCHER[@]}" -m mace.cli.run_train \
             --name="${base}" \
             --log_dir="${LOG_DIR}/task1" \
             --train_file="$xyz" \
@@ -117,7 +124,7 @@ if $RUN_TASK1; then
             --E0s="average" \
             --csv_log_dir="$csv_log_dir" \
             "${COMMON_ARGS[@]}" \
-            > "$task_log" 2>&1
+            "${DDP_ARGS[@]}"
 
         echo "  Task1: $base finished at $(date)" | tee -a "$LOG_FILE"
     done
@@ -145,9 +152,7 @@ if $RUN_TASK2_BASE; then
     cat "${DATA_DIR}/training_data_0ads.xyz" "${DATA_DIR}/training_data_16ads.xyz" > "$COMBINED_TRAIN"
     echo "  Combined train file: $COMBINED_TRAIN" >> "$LOG_FILE"
 
-    task_log="${TASK2_BASE_LOG_DIR}/base_train.log"
-
-    PYTHONUNBUFFERED=1 mace_run_train \
+    PYTHONUNBUFFERED=1 "${DDP_LAUNCHER[@]}" -m mace.cli.run_train \
         --name="base_0ads_16ads" \
         --log_dir="${LOG_DIR}/task2" \
         --train_file="$COMBINED_TRAIN" \
@@ -156,7 +161,7 @@ if $RUN_TASK2_BASE; then
         --E0s="average" \
         --csv_log_dir="$TASK2_BASE_LOG_DIR" \
         "${COMMON_ARGS[@]}" \
-        > "$task_log" 2>&1
+        "${DDP_ARGS[@]}"
 
     echo "  Task2 base training finished at $(date)" | tee -a "$LOG_FILE"
 fi
@@ -190,11 +195,10 @@ if $RUN_TASK2_FT; then
         # --- Zero-shot evaluation (no finetune, just eval) ---
         zs_dir="${RUNS_DIR}/task2/zeroshot/${test_base}"
         zs_log_dir="${LOG_DIR}/task2/zeroshot/${test_base}"
-        zs_log="${zs_log_dir}/eval.log"
         mkdir -p "$zs_dir" "$zs_log_dir"
 
         echo "  Zero-shot eval: $test_base at $(date)" | tee -a "$LOG_FILE"
-        PYTHONUNBUFFERED=1 mace_run_train \
+        PYTHONUNBUFFERED=1 "${DDP_LAUNCHER[@]}" -m mace.cli.run_train \
             --name="zs_${test_base}" \
             --log_dir="${LOG_DIR}/task2/zeroshot" \
             --train_file="$test_xyz" \
@@ -211,13 +215,13 @@ if $RUN_TASK2_FT; then
             --energy_key="energy" \
             --forces_key="forces" \
             --device=cuda \
-            > "$zs_log" 2>&1 || echo "  Zero-shot eval $test_base returned non-zero (may be expected for 0 epoch)" >> "$LOG_FILE"
+            "${DDP_ARGS[@]}" \
+            || echo "  Zero-shot eval $test_base returned non-zero (may be expected for 0 epoch)" >> "$LOG_FILE"
 
         # --- Few-shot finetune with increasing frame counts ---
         for nframes in "${FEWSHOT_NFRAMES[@]}"; do
             ft_dir="${RUNS_DIR}/task2/fewshot/${test_base}/nframes_${nframes}"
             ft_log_dir="${LOG_DIR}/task2/fewshot/${test_base}/nframes_${nframes}"
-            ft_log="${ft_log_dir}/finetune.log"
             mkdir -p "$ft_dir" "$ft_log_dir"
 
             # Extract first N frames from the test xyz for finetune training
@@ -232,7 +236,7 @@ print(f'Extracted {n} frames for few-shot finetune')
 " >> "$LOG_FILE" 2>&1
 
             echo "  Few-shot finetune: $test_base nframes=$nframes at $(date)" | tee -a "$LOG_FILE"
-            PYTHONUNBUFFERED=1 mace_run_train \
+            PYTHONUNBUFFERED=1 "${DDP_LAUNCHER[@]}" -m mace.cli.run_train \
                 --name="ft_${test_base}_${nframes}f" \
                 --log_dir="${LOG_DIR}/task2/fewshot/${test_base}" \
                 --train_file="$ft_train_file" \
@@ -257,7 +261,7 @@ print(f'Extracted {n} frames for few-shot finetune')
                 --amsgrad \
                 --restart_latest \
                 --device=cuda \
-                > "$ft_log" 2>&1
+                "${DDP_ARGS[@]}"
 
             echo "  Few-shot finetune: $test_base nframes=$nframes finished at $(date)" | tee -a "$LOG_FILE"
         done
