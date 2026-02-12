@@ -68,6 +68,12 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--downloads_dir", help="directory for downloads", type=str, default=None
     )
+    parser.add_argument(
+        "--tensorboard_dir",
+        help="directory for TensorBoard layer-monitor logs (if unset, layer monitor is disabled)",
+        type=str,
+        default=None,
+    )
 
     # Device and logging
     parser.add_argument(

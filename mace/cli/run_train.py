@@ -889,6 +889,21 @@ def run(args) -> None:
         from mace.tools.csv_logger import CSVLogger
         csv_logger = CSVLogger(job_name="", base_dir=csv_log_base)
 
+    # Initialize diagnostic layer monitor
+    layer_monitor = None
+    tb_dir = getattr(args, "tensorboard_dir", None)
+    if tb_dir and rank == 0:
+        import sys
+        sys.path.insert(0, "/media/damoxing/che-liu-fileset/kwz/kwz-data")
+        from layer_monitor import LayerMonitor, MACE_LAYER_GROUPS
+        layer_monitor = LayerMonitor(
+            log_dir=tb_dir,
+            model=model,
+            log_freq=100,
+            layer_groups=MACE_LAYER_GROUPS,
+        )
+        layer_monitor.register_hooks()
+
     tools.train(
         model=model,
         loss_fn=loss_fn,
@@ -920,7 +935,11 @@ def run(args) -> None:
         max_steps=getattr(args, 'max_steps', 1_000_000),
         eval_interval_steps=getattr(args, 'eval_interval_steps', 500),
         csv_log_interval=getattr(args, 'csv_log_interval', 10),
+        layer_monitor=layer_monitor,
     )
+
+    if layer_monitor is not None:
+        layer_monitor.close()
 
     logging.info("")
     logging.info("===========RESULTS===========")

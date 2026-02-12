@@ -224,6 +224,7 @@ def train(
     max_steps: int = 1_000_000,
     eval_interval_steps: int = 500,
     csv_log_interval: int = 10,
+    layer_monitor=None,
 ):
     lowest_loss = np.inf
     valid_loss = np.inf
@@ -335,6 +336,7 @@ def train(
             lowest_loss_ref=_lowest_loss_ref,
             patience_counter_ref=_patience_counter_ref,
             keep_last_ref=_keep_last_ref,
+            layer_monitor=layer_monitor,
         )
         # Recover mutable state from refs
         valid_loss = _valid_loss_ref[0]
@@ -445,6 +447,7 @@ def train_one_epoch(
     lowest_loss_ref: Optional[List[float]] = None,
     patience_counter_ref: Optional[List[int]] = None,
     keep_last_ref: Optional[List[bool]] = None,
+    layer_monitor=None,
 ) -> Tuple[int, bool]:
     """Train for one epoch. Returns (global_step, stop_training)."""
     model_to_train = model if distributed_model is None else distributed_model
@@ -576,6 +579,8 @@ def train_one_epoch(
                 _log_train_csv(csv_logger, opt_metrics, step=global_step, rank_val=rank,
                                lr=optimizer.param_groups[0]["lr"], epoch=epoch,
                                training_phase=_training_phase)
+        if layer_monitor is not None:
+            layer_monitor.step_monitor()
         global_step += 1
         if global_step >= max_steps:
             stop_training = True
@@ -601,6 +606,8 @@ def train_one_epoch(
                     _log_train_csv(csv_logger, opt_metrics, step=global_step, rank_val=rank,
                                    lr=optimizer.param_groups[0]["lr"], epoch=epoch,
                                    training_phase=_training_phase)
+            if layer_monitor is not None:
+                layer_monitor.step_monitor()
             global_step += 1
             if global_step >= max_steps:
                 stop_training = True
@@ -856,6 +863,10 @@ class MACELoss(Metric):
         self.add_state(
             "delta_polarizability_per_atom", default=[], dist_reduce_fx="cat"
         )
+        # CO2 classification tracking (positions, cells, ptr for per-graph splitting)
+        self.add_state("_co2_positions", default=[], dist_reduce_fx="cat")
+        self.add_state("_co2_cells", default=[], dist_reduce_fx="cat")
+        self.add_state("_co2_ptrs", default=[], dist_reduce_fx="cat")
 
     def update(self, batch, output):  # pylint: disable=arguments-differ
         loss = self.loss_fn(pred=output, ref=batch)
@@ -894,6 +905,14 @@ class MACELoss(Metric):
         if self.z_table is not None and hasattr(batch, "node_attrs"):
             type_indices = torch.argmax(batch.node_attrs, dim=1)
             self.atom_types.append(type_indices)
+            # Track positions and cells for CO2 classification
+            if hasattr(batch, "positions"):
+                self._co2_positions.append(batch.positions.detach())
+            elif hasattr(batch, "pos"):
+                self._co2_positions.append(batch.pos.detach())
+            if hasattr(batch, "cell"):
+                self._co2_cells.append(batch.cell.detach())
+            self._co2_ptrs.append(batch.ptr.detach())
         if output.get("stress") is not None and batch.stress is not None:
             self.delta_stress.append(batch.stress - output["stress"])
             self.stress_computed += filter_nonzero_weight(
@@ -1046,5 +1065,87 @@ class MACELoss(Metric):
                     elem_metrics["rmse_forces_per_A"] = float(np.sqrt(np.mean(elem_f_err ** 2)))
                 per_atom_type[symbol] = elem_metrics
             aux["per_atom_type"] = per_atom_type
+
+            # CO2 vs framework group metrics
+            try:
+                import sys
+                if "/media/damoxing/che-liu-fileset/kwz/kwz-data" not in sys.path:
+                    sys.path.insert(0, "/media/damoxing/che-liu-fileset/kwz/kwz-data")
+                from co2_classifier import classify_framework_co2
+
+                if len(self._co2_positions) > 0 and len(self._co2_ptrs) > 0:
+                    all_pos = self.convert(self._co2_positions)
+                    z_values = np.array([self.z_table.index_to_z(int(t)) for t in atom_types_cat])
+
+                    # Rebuild per-graph boundaries from concatenated ptr arrays.
+                    # Each batch contributes a ptr of length (num_graphs_in_batch + 1).
+                    # When concatenated, ptrs reset to 0 for each batch. We need to
+                    # reconstruct cumulative offsets across all batches.
+                    raw_ptrs = self.convert(self._co2_ptrs).astype(int)
+                    # Detect batch boundaries: ptr always starts with 0
+                    graph_boundaries = [0]  # cumulative atom offsets for each graph start
+                    cum_offset = 0
+                    i = 0
+                    while i < len(raw_ptrs):
+                        # Each batch's ptr starts at 0; skip the leading 0
+                        if raw_ptrs[i] == 0 and i > 0:
+                            # New batch detected
+                            pass
+                        if raw_ptrs[i] == 0:
+                            # This is the start of a batch ptr; walk through it
+                            j = i + 1
+                            while j < len(raw_ptrs) and raw_ptrs[j] > raw_ptrs[j - 1]:
+                                graph_boundaries.append(cum_offset + int(raw_ptrs[j]))
+                                j += 1
+                            cum_offset = graph_boundaries[-1]
+                            i = j
+                        else:
+                            i += 1
+
+                    # Retrieve first cell for PBC (all frames share same crystal)
+                    cell = None
+                    if len(self._co2_cells) > 0:
+                        all_cells = self.convert(self._co2_cells)
+                        cell = all_cells[:3]  # first 3x3
+
+                    # Classify each graph independently
+                    is_co2_all = np.zeros(len(atom_types_cat), dtype=bool)
+                    for g_idx in range(len(graph_boundaries) - 1):
+                        start = graph_boundaries[g_idx]
+                        end = graph_boundaries[g_idx + 1]
+                        if end <= start or end > len(all_pos):
+                            continue
+                        g_pos = all_pos[start:end]
+                        g_z = z_values[start:end]
+                        g_co2 = classify_framework_co2(g_pos, g_z, cell=cell, pbc=True)
+                        is_co2_all[start:end] = g_co2
+
+                    n_co2 = int(is_co2_all.sum())
+                    n_framework = int((~is_co2_all).sum())
+
+                    co2_metrics = {}
+                    fw_metrics = {}
+                    if has_forces and n_co2 > 0:
+                        co2_f_err = delta_fs_cat[is_co2_all]
+                        co2_metrics["mae_forces_per_A"] = float(np.mean(np.abs(co2_f_err)))
+                        co2_metrics["rmse_forces_per_A"] = float(np.sqrt(np.mean(co2_f_err ** 2)))
+                    if has_forces and n_framework > 0:
+                        fw_f_err = delta_fs_cat[~is_co2_all]
+                        fw_metrics["mae_forces_per_A"] = float(np.mean(np.abs(fw_f_err)))
+                        fw_metrics["rmse_forces_per_A"] = float(np.sqrt(np.mean(fw_f_err ** 2)))
+                    if has_energy and n_co2 > 0:
+                        co2_e_err = e_errors_cat[is_co2_all]
+                        co2_metrics["mae_energy_per_atom"] = float(np.mean(np.abs(co2_e_err)))
+                    if has_energy and n_framework > 0:
+                        fw_e_err = e_errors_cat[~is_co2_all]
+                        fw_metrics["mae_energy_per_atom"] = float(np.mean(np.abs(fw_e_err)))
+
+                    if co2_metrics:
+                        per_atom_type["CO2"] = co2_metrics
+                    if fw_metrics:
+                        per_atom_type["framework"] = fw_metrics
+                    aux["per_atom_type"] = per_atom_type
+            except Exception as e:
+                logging.debug(f"CO2 classification failed: {e}")
 
         return aux["loss"], aux
